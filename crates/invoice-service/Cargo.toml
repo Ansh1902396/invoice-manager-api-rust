@@ -1,0 +1,37 @@
+[package]
+name = "invoice-service"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "invoice_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "invoice-service"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+rand.workspace = true
+hex.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tower-http.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+reqwest = { workspace = true, features = ["json"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
+sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "uuid", "chrono", "migrate"] }
+tower = "0.5"

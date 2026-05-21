@@ -1,0 +1,260 @@
+openapi: 3.0.3
+info:
+  title: Invoice & Payment Service
+  version: 1.0.0
+  description: Minimal invoice and payment API with API key auth, idempotent payments, and signed webhooks.
+servers:
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Business-scoped API key (e.g. dodo_live_...)
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              example: invalid_state_transition
+            message:
+              type: string
+          required: [code, message]
+      required: [error]
+    Customer:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string, format: email }
+      required: [id, name, email]
+    LineItem:
+      type: object
+      properties:
+        description: { type: string }
+        quantity: { type: integer, minimum: 1 }
+        unit_amount_cents: { type: integer, minimum: 0 }
+      required: [description, quantity, unit_amount_cents]
+    Invoice:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        customer_id: { type: string, format: uuid }
+        total_cents: { type: integer }
+        state:
+          type: string
+          enum: [draft, open, paid, void, uncollectible]
+        due_date: { type: string, format: date }
+        line_items:
+          type: array
+          items: { $ref: '#/components/schemas/LineItem' }
+      required: [id, customer_id, total_cents, state, due_date, line_items]
+    PayRequest:
+      type: object
+      properties:
+        card_token:
+          type: string
+          enum: [tok_success, tok_insufficient_funds, tok_card_declined, tok_timeout, tok_network_error]
+      required: [card_token]
+    PaymentAttempt:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        invoice_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [processing, pending, succeeded, failed]
+    PayResponse:
+      type: object
+      properties:
+        payment_attempt: { $ref: '#/components/schemas/PaymentAttempt' }
+        invoice_state: { type: string }
+        message: { type: string }
+    WebhookEndpoint:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string, format: uri }
+        signing_secret: { type: string, description: Shown once on create }
+      required: [id, url, signing_secret]
+paths:
+  /health:
+    get:
+      security: []
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+  /v1/customers:
+    post:
+      summary: Create customer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                email: { type: string }
+              required: [name, email]
+      responses:
+        '200':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Customer' }
+        '400':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    get:
+      summary: List customers
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, default: 20 }
+        - in: query
+          name: offset
+          schema: { type: integer, default: 0 }
+      responses:
+        '200':
+          description: OK
+  /v1/customers/{id}:
+    get:
+      summary: Get customer
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Customer' }
+        '404':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/invoices:
+    post:
+      summary: Create invoice (state=open, server computes total)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                customer_id: { type: string, format: uuid }
+                due_date: { type: string, format: date }
+                line_items:
+                  type: array
+                  items: { $ref: '#/components/schemas/LineItem' }
+              required: [customer_id, due_date, line_items]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Invoice' }
+    get:
+      summary: List invoices
+      parameters:
+        - in: query
+          name: state
+          schema:
+            type: string
+            enum: [draft, open, paid, void, uncollectible]
+      responses:
+        '200':
+          description: OK
+  /v1/invoices/{id}:
+    get:
+      summary: Get invoice
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Invoice' }
+  /v1/invoices/{id}/void:
+    post:
+      summary: Void an open invoice
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Invoice' }
+        '409':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/invoices/{id}/pay:
+    post:
+      summary: Attempt payment (idempotent)
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PayRequest' }
+      responses:
+        '200':
+          description: Payment succeeded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayResponse' }
+        '202':
+          description: Payment pending (PSP slow/unreachable)
+        '402':
+          description: Payment failed (declined / insufficient funds)
+        '409':
+          description: Invoice not payable
+        '422':
+          description: Idempotency key reused with different body
+  /v1/webhook-endpoints:
+    post:
+      summary: Register webhook URL
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url: { type: string, format: uri }
+              required: [url]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookEndpoint' }
+    get:
+      summary: List webhook endpoints
+      responses:
+        '200':
+          description: OK
