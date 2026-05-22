@@ -4,14 +4,78 @@
 
 ```mermaid
 erDiagram
-    businesses ||--o{ api_keys : has
-    businesses ||--o{ customers : has
-    businesses ||--o{ invoices : has
-    businesses ||--o{ webhook_endpoints : has
-    customers ||--o{ invoices : receives
-    invoices ||--o{ invoice_line_items : contains
-    invoices ||--o{ payment_attempts : has
-    webhook_endpoints ||--o{ webhook_deliveries : receives
+    BUSINESSES ||--o{ API_KEYS : has
+    BUSINESSES ||--o{ CUSTOMERS : has
+    BUSINESSES ||--o{ INVOICES : owns
+    BUSINESSES ||--o{ PAYMENT_ATTEMPTS : owns
+    BUSINESSES ||--o{ WEBHOOK_ENDPOINTS : owns
+    CUSTOMERS ||--o{ INVOICES : receives
+    INVOICES ||--o{ INVOICE_LINE_ITEMS : contains
+    INVOICES ||--o{ PAYMENT_ATTEMPTS : has
+    WEBHOOK_ENDPOINTS ||--o{ WEBHOOK_DELIVERIES : receives
+
+    BUSINESSES {
+        uuid id PK
+        text name
+        timestamptz created_at
+    }
+
+    API_KEYS {
+        uuid id PK
+        uuid business_id FK
+        text key_prefix
+        text key_hash
+        timestamptz revoked_at
+    }
+
+    CUSTOMERS {
+        uuid id PK
+        uuid business_id FK
+        text name
+        text email
+    }
+
+    INVOICES {
+        uuid id PK
+        uuid business_id FK
+        uuid customer_id FK
+        bigint total_cents
+        invoice_state state
+        date due_date
+    }
+
+    INVOICE_LINE_ITEMS {
+        uuid id PK
+        uuid invoice_id FK
+        text description
+        bigint quantity
+        bigint unit_amount_cents
+    }
+
+    PAYMENT_ATTEMPTS {
+        uuid id PK
+        uuid business_id FK
+        uuid invoice_id FK
+        text idempotency_key
+        payment_attempt_status status
+        text psp_ref
+    }
+
+    WEBHOOK_ENDPOINTS {
+        uuid id PK
+        uuid business_id FK
+        text url
+        text signing_secret
+    }
+
+    WEBHOOK_DELIVERIES {
+        uuid id PK
+        uuid business_id FK
+        uuid endpoint_id FK
+        text event_type
+        webhook_delivery_status status
+        int attempt_count
+    }
 ```
 
 | Table | Primary key | Important indexes |
@@ -33,13 +97,18 @@ erDiagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> open: POST /invoices
-    open --> paid: payment succeeded
-    open --> void: POST /invoices/:id/void
-    open --> uncollectible: reserved for future dunning
-    paid --> [*]
-    void --> [*]
-    uncollectible --> [*]
+    state "open" as Open
+    state "paid" as Paid
+    state "void" as Void
+    state "uncollectible" as Uncollectible
+
+    [*] --> Open: "POST /invoices"
+    Open --> Paid: "payment succeeded"
+    Open --> Void: "POST /invoices/{id}/void"
+    Open --> Uncollectible: "reserved for future dunning"
+    Paid --> [*]
+    Void --> [*]
+    Uncollectible --> [*]
 ```
 
 | Transition | Trigger | Terminal? |
