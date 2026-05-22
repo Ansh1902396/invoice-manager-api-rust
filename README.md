@@ -109,7 +109,7 @@ Tests cover:
 ## Demo Video
 
 <!-- Replace with your Loom / Drive link before submission -->
-https://example.com/your-demo-video
+https://www.youtube.com/watch?v=5JMDzTYv4sA
 
 ## API documentation
 
@@ -123,40 +123,3 @@ See [DESIGN.md](./DESIGN.md).
 
 See [AI_USAGE.md](./AI_USAGE.md).
 
-## What's left before submission
-
-The implementation is complete; these items are still required to submit the assignment.
-
-### Required
-
-- [ ] **Verify locally** — from the repo root:
-  ```bash
-  docker compose up --build
-  curl http://localhost:8080/health
-  cargo test -p invoice-service --test integration
-  ```
-  Run the curl examples above (customer → invoice → pay success → pay decline on a new invoice).
-
-- [ ] **Record demo video (5–10 min)** — cover, in order:
-  1. Architecture overview (services, data model, request flow)
-  2. Live demo (`docker compose up`, create customer/invoice, successful payment, declined payment, webhook deliveries)
-  3. Invoice state machine walkthrough (unscripted)
-  4. One failure-mode walkthrough from [DESIGN.md](./DESIGN.md) section 3 (open the relevant code; `tok_timeout` or `tok_network_error` work well)
-
-- [ ] **Add video link** — replace the placeholder in [Demo Video](#demo-video) with a public Loom, Drive, or S3 link (no login required).
-
-- [ ] **Push to GitHub** — public repo or share access with Dodo. Include source, migrations, `docker-compose.yml`, and all docs.
-
-- [ ] **Review [AI_USAGE.md](./AI_USAGE.md)** — confirm it accurately reflects how you used AI and what you decided yourself.
-
-### Optional polish (not blockers)
-
-- [ ] `GET /v1/invoices/:id` could include the latest payment attempt (mentioned in the plan, not required by the assignment spec).
-- [ ] `POST /api-keys` for key rotation is not implemented; the seeded demo key is sufficient for the demo.
-
-### Pre-submit checklist
-
-- [ ] `docker compose up` works on a clean machine with no manual steps
-- [ ] Integration tests pass
-- [ ] Demo video link is in README and accessible without login
-- [ ] No floats in the money path (all amounts are integer cents)
