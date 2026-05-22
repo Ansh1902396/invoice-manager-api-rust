@@ -8,10 +8,12 @@ erDiagram
     BUSINESSES ||--o{ CUSTOMERS : has
     BUSINESSES ||--o{ INVOICES : owns
     BUSINESSES ||--o{ PAYMENT_ATTEMPTS : owns
+    BUSINESSES ||--o{ REFUNDS : owns
     BUSINESSES ||--o{ WEBHOOK_ENDPOINTS : owns
     CUSTOMERS ||--o{ INVOICES : receives
     INVOICES ||--o{ INVOICE_LINE_ITEMS : contains
     INVOICES ||--o{ PAYMENT_ATTEMPTS : has
+    PAYMENT_ATTEMPTS ||--o{ REFUNDS : refunded_by
     WEBHOOK_ENDPOINTS ||--o{ WEBHOOK_DELIVERIES : receives
 
     BUSINESSES {
@@ -61,6 +63,16 @@ erDiagram
         text psp_ref
     }
 
+    REFUNDS {
+        uuid id PK
+        uuid business_id FK
+        uuid payment_attempt_id FK
+        text idempotency_key
+        bigint amount_cents
+        refund_state state
+        text psp_ref
+    }
+
     WEBHOOK_ENDPOINTS {
         uuid id PK
         uuid business_id FK
@@ -86,12 +98,13 @@ erDiagram
 | `invoices` | UUID | `(business_id, state)`, `(customer_id)` |
 | `invoice_line_items` | UUID | `(invoice_id)` |
 | `payment_attempts` | UUID | **UNIQUE `(business_id, idempotency_key)`**, `(invoice_id)` |
+| `refunds` | UUID | **UNIQUE `(business_id, idempotency_key)`**, `(payment_attempt_id, state)` |
 | `webhook_endpoints` | UUID | `(business_id)` |
 | `webhook_deliveries` | UUID | `(status, next_retry_at)` where pending |
 
 **Why this shape:** Invoices and line items are normalized so totals are computed server-side from immutable line rows. Payment attempts are first-class rows rather than JSON blobs so idempotency keys, PSP references, and retry state are queryable. Webhook deliveries are decoupled from API handlers in their own outbox table.
 
-**At 100× scale:** Partition `webhook_deliveries` and `payment_attempts` by time or business_id, add read replicas for list endpoints, and move webhook delivery to a dedicated queue (SQS/Kafka) with consumer workers.
+**At 100× scale:** Partition `webhook_deliveries`, `payment_attempts`, and `refunds` by time or business_id, add read replicas for list endpoints, and move webhook/refund delivery to a dedicated queue (SQS/Kafka) with consumer workers.
 
 ## 2. Invoice State Machine
 
@@ -158,11 +171,77 @@ Inside the locked transaction the invoice state is checked. `paid` is not payabl
 
 **Retry policy:** 6 attempts at **0s, 30s, 2m, 10m, 1h, 6h** (~7.5 hours total). Failed deliveries after max attempts are marked `dead` and logged.
 
+**Dead queue reconciliation:** `webhook_deliveries.status = dead` is the local dead-letter queue. A reconciliation job should periodically scan dead deliveries, group them by business and event type, and compare them against the source tables (`invoices`, `payment_attempts`, `refunds`) to decide whether to replay, suppress, or escalate. Replays should create a new delivery row linked to the original dead delivery rather than mutating history; suppressions should record an operator reason; repeated dead deliveries should page support or surface in an admin dashboard.
+
 **Missed events:** Businesses reconcile via `GET /invoices` and periodic full sync; production would add a signed event log API.
 
 **Decoupling:** API handlers insert into `webhook_deliveries` and return. A background worker polls due rows and POSTs to registered URLs — webhook latency never blocks payment responses.
 
-## 5. API Key Model
+## 5. Refund Pipeline Design
+
+Refunds are not implemented in the MVP, but the production design should treat refunds as their own ledgered workflow rather than directly mutating payment attempts.
+
+```mermaid
+stateDiagram-v2
+    state "requested" as Requested
+    state "processing" as Processing
+    state "succeeded" as Succeeded
+    state "failed" as Failed
+    state "requires_reconciliation" as RequiresReconciliation
+    state "canceled" as Canceled
+
+    [*] --> Requested: "POST /refunds"
+    Requested --> Processing: "worker claims refund"
+    Processing --> Succeeded: "PSP refund succeeded"
+    Processing --> Failed: "PSP refund rejected"
+    Processing --> RequiresReconciliation: "timeout or ambiguous PSP result"
+    RequiresReconciliation --> Processing: "safe retry"
+    RequiresReconciliation --> Succeeded: "PSP confirms refunded"
+    RequiresReconciliation --> Failed: "PSP confirms not refunded"
+    Requested --> Canceled: "cancel before PSP call"
+    Succeeded --> [*]
+    Failed --> [*]
+    Canceled --> [*]
+```
+
+Suggested tables:
+
+| Table | Purpose |
+|-------|---------|
+| `refunds` | One row per refund request, including amount, idempotency key, state, PSP reference, and failure code |
+| `refund_events` | Append-only audit trail of state transitions and PSP responses |
+| `refund_dead_queue` | Ambiguous or exhausted refund jobs requiring reconciliation/operator review |
+
+Refund rules:
+
+1. A refund must reference a `succeeded` payment attempt.
+2. `amount_cents` must be positive and cannot exceed the unrefunded amount for that payment attempt.
+3. Partial refunds are allowed by inserting multiple refund rows until the refundable balance reaches zero.
+4. Idempotency is enforced with `UNIQUE (business_id, idempotency_key)`.
+5. The PSP refund idempotency key should be derived from the internal refund id so worker retries do not double-refund.
+
+Pipeline:
+
+1. `POST /v1/refunds` validates the payment attempt, computes remaining refundable balance under a row lock, inserts `refunds.state = requested`, and returns quickly.
+2. A refund worker claims requested rows using `FOR UPDATE SKIP LOCKED`, marks them `processing`, and calls the PSP refund API.
+3. PSP success marks the refund `succeeded`, appends a `refund_events` row, and enqueues `refund.succeeded`.
+4. PSP business failure marks the refund `failed`, stores `failure_code`, appends an event, and enqueues `refund.failed`.
+5. PSP timeout/network ambiguity marks the refund `requires_reconciliation`; the refund reconciler polls PSP by refund id/reference before retrying.
+6. If reconciliation exceeds retry limits, the refund is copied to `refund_dead_queue` with the last PSP response and operator instructions. Operators should never manually mark a refund succeeded without PSP evidence.
+
+Invoice relationship:
+
+- A fully refunded invoice should not move back from `paid` to `open`; it remains `paid` with derived refund status (`partially_refunded` or `refunded`) calculated from refund totals.
+- This avoids mixing collection state with money-movement reversal state.
+
+Webhook events:
+
+- `refund.created`
+- `refund.succeeded`
+- `refund.failed`
+- `refund.requires_reconciliation`
+
+## 6. API Key Model
 
 - **Generation:** `dodo_live_` + 32 random alphanumeric characters.
 - **Storage:** SHA-256 hash + 8-character prefix for lookup. Plaintext never stored.
@@ -171,16 +250,16 @@ Inside the locked transaction the invoice state is checked. `paid` is not payabl
 - **Revocation:** Soft-delete via `revoked_at`; middleware rejects revoked keys.
 - **Blast radius:** A leaked key grants full access to that business's data. Prefix display helps identify which key leaked without exposing the secret.
 
-## 6. What We Cut and Why
+## 7. What We Cut and Why
 
-1. **Refunds / partial payments** — out of scope; would need credit notes and PSP refund APIs.
+1. **Refund API implementation** — designed above but out of MVP scope; it needs PSP refund APIs, refund ledger tables, and operator reconciliation tooling.
 2. **Subscriptions / recurring billing** — different product surface entirely.
 3. **Multi-currency / tax** — assignment explicitly excluded; keeps money path integer USD cents only.
 4. **Rate limiting** — discussed in production gaps; not needed for correctness demo.
 5. **Email notifications** — webhooks cover business notification; email is redundant for MVP.
 
-## 7. Production Readiness Gaps
+## 8. Production Readiness Gaps
 
-1. **Observability** — no metrics, structured trace IDs, or alerting on dead webhook deliveries.
+1. **Observability** — no metrics, structured trace IDs, or alerting on dead webhook/refund queue growth.
 2. **Rate limiting & abuse protection** — API keys authenticate but do not throttle brute-force or pay spam.
 3. **Audit log** — no immutable record of who changed invoice state or revoked keys.
