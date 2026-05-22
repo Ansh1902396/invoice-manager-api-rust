@@ -15,8 +15,6 @@ pub const RETRY_INTERVALS_SECS: [i64; 6] = [0, 30, 120, 600, 3600, 21600];
 #[derive(sqlx::FromRow)]
 struct DueDeliveryRow {
     id: Uuid,
-    business_id: Uuid,
-    endpoint_id: Uuid,
     event_type: String,
     payload: Value,
     attempt_count: i32,
@@ -86,8 +84,7 @@ pub async fn run_webhook_worker(pool: PgPool) {
 async fn process_due_deliveries(pool: &PgPool, client: &Client) -> anyhow::Result<()> {
     let rows = sqlx::query_as::<_, DueDeliveryRow>(
         r#"
-        SELECT d.id, d.business_id, d.endpoint_id, d.event_type, d.payload,
-               d.attempt_count, e.url, e.signing_secret
+        SELECT d.id, d.event_type, d.payload, d.attempt_count, e.url, e.signing_secret
         FROM webhook_deliveries d
         JOIN webhook_endpoints e ON e.id = d.endpoint_id
         WHERE d.status = 'pending' AND d.next_retry_at <= NOW()
@@ -148,12 +145,7 @@ async fn process_due_deliveries(pool: &PgPool, client: &Client) -> anyhow::Resul
     Ok(())
 }
 
-async fn schedule_retry(
-    pool: &PgPool,
-    id: Uuid,
-    attempt: i32,
-    err: &str,
-) -> anyhow::Result<()> {
+async fn schedule_retry(pool: &PgPool, id: Uuid, attempt: i32, err: &str) -> anyhow::Result<()> {
     let idx = (attempt as usize).saturating_sub(1);
     if idx >= RETRY_INTERVALS_SECS.len() {
         sqlx::query(

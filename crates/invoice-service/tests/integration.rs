@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 #[tokio::test]
 async fn concurrent_pay_only_one_succeeds() {
-    let app = setup_test_app().await;
+    let (app, _pool) = setup_test_app().await;
     let customer = create_customer(&app).await;
     let invoice = create_invoice(&app, customer).await;
     let invoice_id = invoice["id"].as_str().unwrap();
@@ -27,7 +27,7 @@ async fn concurrent_pay_only_one_succeeds() {
                 .method("POST")
                 .uri(format!("/v1/invoices/{invoice_id}/pay"))
                 .header("Authorization", api_key_header())
-                .header("Idempotency-Key", format!("concurrent-{i}"))
+                .header("Idempotency-Key", format!("concurrent-{invoice_id}-{i}"))
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap();
@@ -47,7 +47,10 @@ async fn concurrent_pay_only_one_succeeds() {
     }
 
     assert_eq!(ok_count, 1, "exactly one payment should succeed");
-    assert_eq!(conflict_count, 9, "other concurrent attempts should conflict");
+    assert_eq!(
+        conflict_count, 9,
+        "other concurrent attempts should conflict"
+    );
 
     let invoice = get_invoice(&app, invoice_id).await;
     assert_eq!(invoice["state"], "paid");
@@ -55,17 +58,17 @@ async fn concurrent_pay_only_one_succeeds() {
 
 #[tokio::test]
 async fn idempotency_replays_without_double_charge() {
-    let app = setup_test_app().await;
+    let (app, pool) = setup_test_app().await;
     let customer = create_customer(&app).await;
     let invoice = create_invoice(&app, customer).await;
     let invoice_id = invoice["id"].as_str().unwrap();
-    let key = "idem-test-key";
+    let key = format!("idem-test-key-{invoice_id}");
 
-    let first = pay(&app, invoice_id, "tok_success", key).await;
+    let first = pay(&app, invoice_id, "tok_success", &key).await;
     assert_eq!(first.status(), StatusCode::OK);
     let first_body = body_json(first).await;
 
-    let second = pay(&app, invoice_id, "tok_success", key).await;
+    let second = pay(&app, invoice_id, "tok_success", &key).await;
     assert_eq!(second.status(), StatusCode::OK);
     let second_body = body_json(second).await;
     assert_eq!(first_body, second_body);
@@ -74,7 +77,7 @@ async fn idempotency_replays_without_double_charge() {
         "SELECT COUNT(*) FROM payment_attempts WHERE invoice_id = $1 AND status = 'succeeded'",
     )
     .bind(Uuid::parse_str(invoice_id).unwrap())
-    .fetch_one(&common::test_pool().await)
+    .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(attempts, 1);
@@ -82,13 +85,14 @@ async fn idempotency_replays_without_double_charge() {
 
 #[tokio::test]
 async fn psp_network_error_does_not_corrupt_invoice() {
-    let app = setup_test_app().await;
+    let (app, pool) = setup_test_app().await;
     let customer = create_customer(&app).await;
     let invoice = create_invoice(&app, customer).await;
     let invoice_id = invoice["id"].as_str().unwrap();
+    let key = format!("net-err-key-{invoice_id}");
 
     let start = Instant::now();
-    let resp = pay(&app, invoice_id, "tok_network_error", "net-err-key").await;
+    let resp = pay(&app, invoice_id, "tok_network_error", &key).await;
     assert!(
         start.elapsed() < Duration::from_secs(6),
         "endpoint must not hang on network error"
@@ -102,7 +106,7 @@ async fn psp_network_error_does_not_corrupt_invoice() {
         "SELECT COUNT(*) FROM payment_attempts WHERE invoice_id = $1 AND status = 'pending'",
     )
     .bind(Uuid::parse_str(invoice_id).unwrap())
-    .fetch_one(&common::test_pool().await)
+    .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(pending, 1);

@@ -13,9 +13,7 @@ use crate::{
     auth::AuthContext,
     domain::{InvoiceState, PaymentAttemptStatus},
     error::{AppError, AppResult},
-    webhooks,
-    workers,
-    AppState,
+    webhooks, workers, AppState,
 };
 
 #[derive(Deserialize, Serialize)]
@@ -25,9 +23,6 @@ pub struct PayInvoiceRequest {
 
 #[derive(sqlx::FromRow)]
 struct ExistingAttemptRow {
-    id: Uuid,
-    invoice_id: Uuid,
-    status: PaymentAttemptStatus,
     request_body_hash: String,
     response_status_code: Option<i32>,
     response_body: Option<Value>,
@@ -35,13 +30,7 @@ struct ExistingAttemptRow {
 
 #[derive(sqlx::FromRow)]
 struct InvoiceLockRow {
-    id: Uuid,
     state: InvoiceState,
-}
-
-#[derive(sqlx::FromRow)]
-struct InFlightRow {
-    id: Uuid,
 }
 
 fn hash_body(body: &PayInvoiceRequest) -> String {
@@ -67,7 +56,7 @@ pub async fn pay_invoice(
 
     if let Some(existing) = sqlx::query_as::<_, ExistingAttemptRow>(
         r#"
-        SELECT id, invoice_id, status, request_body_hash, response_status_code, response_body
+        SELECT request_body_hash, response_status_code, response_body
         FROM payment_attempts
         WHERE business_id = $1 AND idempotency_key = $2
         "#,
@@ -89,11 +78,15 @@ pub async fn pay_invoice(
         ));
     }
 
-    let mut tx = state.db.begin().await.map_err(|e| AppError::Internal(e.into()))?;
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
 
-    let invoice = sqlx::query_as::<_, InvoiceLockRow>(
+    let invoice = match sqlx::query_as::<_, InvoiceLockRow>(
         r#"
-        SELECT id, state
+        SELECT state
         FROM invoices
         WHERE id = $1 AND business_id = $2
         FOR UPDATE
@@ -104,16 +97,27 @@ pub async fn pay_invoice(
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| AppError::Internal(e.into()))?
-    .ok_or(AppError::NotFound)?;
+    {
+        Some(invoice) => invoice,
+        None => {
+            tx.rollback()
+                .await
+                .map_err(|e| AppError::Internal(e.into()))?;
+            return Err(AppError::NotFound);
+        }
+    };
 
     if !invoice.state.can_pay() {
+        tx.rollback()
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
         return Err(AppError::Conflict(format!(
             "invoice is not payable in state {:?}",
             invoice.state
         )));
     }
 
-    let in_flight = sqlx::query_as::<_, InFlightRow>(
+    let in_flight = sqlx::query_scalar::<_, Uuid>(
         r#"
         SELECT id FROM payment_attempts
         WHERE invoice_id = $1 AND status IN ('processing', 'pending')
@@ -126,6 +130,9 @@ pub async fn pay_invoice(
     .map_err(|e| AppError::Internal(e.into()))?;
 
     if in_flight.is_some() {
+        tx.rollback()
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
         return Err(AppError::Conflict("payment already in progress".into()));
     }
 
@@ -153,7 +160,11 @@ pub async fn pay_invoice(
 
     let outcome = state.psp.charge(&body.card_token).await;
 
-    let mut tx = state.db.begin().await.map_err(|e| AppError::Internal(e.into()))?;
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
 
     let (status, invoice_state, webhook_payload) =
         workers::apply_psp_outcome_in_tx(&mut tx, attempt_id, invoice_id, outcome)
